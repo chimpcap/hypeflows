@@ -148,6 +148,156 @@ def estimated_inflow_hype(quote: dict, ratio: float, hype_price: float) -> float
     return estimated_inflow_usd(quote, ratio) / float(hype_price)
 
 
+def fetch_etf_daily_history(ticker: str, range_str: str = "1mo") -> pd.DataFrame:
+    """Daily bars since the ETF started trading.
+
+    Returns: date, close, volume_shares, volume_usd.
+    """
+    r = requests.get(
+        YF_CHART_URL.format(ticker=ticker),
+        params={"interval": "1d", "range": range_str},
+        headers=YF_HEADERS,
+        timeout=15,
+    )
+    r.raise_for_status()
+    payload = r.json()["chart"]["result"][0]
+    ts = payload.get("timestamp") or []
+    if not ts:
+        return pd.DataFrame(columns=["date", "close", "volume_shares", "volume_usd"])
+    q = payload["indicators"]["quote"][0]
+    df = pd.DataFrame(
+        {
+            "date": pd.to_datetime(ts, unit="s", utc=True).date,
+            "close": q.get("close"),
+            "volume_shares": q.get("volume"),
+        }
+    ).dropna(subset=["close"])
+    df["volume_shares"] = df["volume_shares"].fillna(0)
+    df["volume_usd"] = df["close"] * df["volume_shares"]
+    return df.reset_index(drop=True)
+
+
+def fetch_etf_intraday_history(ticker: str, range_str: str = "10d") -> pd.DataFrame:
+    """15-minute bars across the past `range_str` (Yahoo supports up to ~60d at 15m).
+
+    Returns: ts, date, close, volume, dollar_volume.
+    """
+    r = requests.get(
+        YF_CHART_URL.format(ticker=ticker),
+        params={"interval": "15m", "range": range_str},
+        headers=YF_HEADERS,
+        timeout=15,
+    )
+    r.raise_for_status()
+    payload = r.json()["chart"]["result"][0]
+    ts = payload.get("timestamp") or []
+    if not ts:
+        return pd.DataFrame(columns=["ts", "date", "close", "volume", "dollar_volume"])
+    q = payload["indicators"]["quote"][0]
+    df = pd.DataFrame(
+        {
+            "ts": pd.to_datetime(ts, unit="s", utc=True),
+            "close": q.get("close"),
+            "volume": q.get("volume"),
+        }
+    ).dropna(subset=["close"])
+    df["volume"] = df["volume"].fillna(0)
+    df["dollar_volume"] = df["close"] * df["volume"]
+    df["date"] = df["ts"].dt.tz_convert("America/New_York").dt.date
+    return df.reset_index(drop=True)
+
+
+def compute_implied_ratios(
+    etf_csv: pd.DataFrame, daily_by_ticker: dict[str, pd.DataFrame]
+) -> dict:
+    """Implied inflow ratio per ETF: cumulative known inflow / cumulative volume since launch.
+
+    Uses latest known AUM as the proxy for cumulative net inflows (valid only when
+    price moves are modest, which is the case for these brand-new funds).
+    Returns: {ticker: {"ratio": float|None, "inflow_usd": float, "volume_usd": float,
+                       "through_date": date, "note": str}, "combined": {...}}.
+    """
+    out: dict = {}
+    total_inflow = 0.0
+    total_volume = 0.0
+    have_any = False
+    for ticker, daily in daily_by_ticker.items():
+        rows = etf_csv[etf_csv["fund"] == ticker].sort_values("date")
+        if rows.empty or daily.empty:
+            out[ticker] = {"ratio": None, "inflow_usd": 0.0, "volume_usd": 0.0,
+                           "through_date": None, "note": "no data"}
+            continue
+        aum_rows = rows.dropna(subset=["aum_usd"])
+        inflow_rows = rows.dropna(subset=["net_flow_usd"])
+        if not aum_rows.empty:
+            latest_aum = float(aum_rows["aum_usd"].iloc[-1])
+            through_date = aum_rows["date"].iloc[-1].date()
+            note = "cumulative AUM / volume since launch"
+        elif not inflow_rows.empty:
+            latest_aum = float(inflow_rows["net_flow_usd"].sum())
+            through_date = inflow_rows["date"].iloc[-1].date()
+            note = "sum of known daily inflows / volume on those days"
+        else:
+            out[ticker] = {"ratio": None, "inflow_usd": 0.0, "volume_usd": 0.0,
+                           "through_date": None, "note": "no inflow data"}
+            continue
+        vol_total = float(daily[daily["date"] <= through_date]["volume_usd"].sum())
+        ratio = (latest_aum / vol_total) if vol_total > 0 else None
+        out[ticker] = {"ratio": ratio, "inflow_usd": latest_aum, "volume_usd": vol_total,
+                       "through_date": through_date, "note": note}
+        if ratio is not None:
+            total_inflow += latest_aum
+            total_volume += vol_total
+            have_any = True
+    out["combined"] = {
+        "ratio": (total_inflow / total_volume) if (have_any and total_volume > 0) else None,
+        "inflow_usd": total_inflow,
+        "volume_usd": total_volume,
+    }
+    return out
+
+
+def historical_cumulative_inflows(
+    intraday_by_ticker: dict[str, pd.DataFrame],
+    etf_csv: pd.DataFrame,
+    daily_by_ticker: dict[str, pd.DataFrame],
+    fallback_ratio: float,
+) -> pd.DataFrame:
+    """Per-bar cumulative inflow estimate across the launch-to-now window.
+
+    For each (ticker, date):
+      ratio_for_day = known_day_inflow / known_day_volume   if disclosed in etf_csv
+                    = fallback_ratio                        otherwise
+    Per 15-min bar: estimated_inflow = bar_dollar_volume * ratio_for_day.
+    Cumulated per ticker.
+
+    Returns: ts, ticker, bar_inflow_usd, cum_inflow_usd.
+    """
+    frames = []
+    for ticker, bars in intraday_by_ticker.items():
+        if bars.empty:
+            continue
+        daily = daily_by_ticker.get(ticker, pd.DataFrame())
+        known = etf_csv[(etf_csv["fund"] == ticker) & etf_csv["net_flow_usd"].notna()]
+        day_ratios: dict = {}
+        if not known.empty and not daily.empty:
+            daily_lookup = {row["date"]: row["volume_usd"] for _, row in daily.iterrows()}
+            for _, r in known.iterrows():
+                d = r["date"].date()
+                vol = daily_lookup.get(d)
+                if vol and vol > 0:
+                    day_ratios[d] = float(r["net_flow_usd"]) / float(vol)
+        df = bars.copy()
+        df["ratio"] = df["date"].map(day_ratios).fillna(fallback_ratio)
+        df["bar_inflow_usd"] = df["dollar_volume"] * df["ratio"]
+        df["cum_inflow_usd"] = df["bar_inflow_usd"].cumsum()
+        df["ticker"] = ticker
+        frames.append(df[["ts", "ticker", "bar_inflow_usd", "cum_inflow_usd"]])
+    if not frames:
+        return pd.DataFrame(columns=["ts", "ticker", "bar_inflow_usd", "cum_inflow_usd"])
+    return pd.concat(frames, ignore_index=True).sort_values("ts").reset_index(drop=True)
+
+
 # ---------- PURR treasury (CSV until SEC/on-chain wired) --------------------
 
 def load_purr_holdings() -> pd.DataFrame:

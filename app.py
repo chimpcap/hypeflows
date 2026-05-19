@@ -20,6 +20,8 @@ import data as src
 
 PRICE_TTL = 3600
 VOLUME_TTL = 10
+INTRADAY_HIST_TTL = 900       # 15-min bars don't change faster than this
+DAILY_HIST_TTL = 1800         # daily bars settle once per session
 FRAGMENT_REFRESH = "15s"
 ETF_TICKERS = ("BHYP", "THYP")
 
@@ -39,6 +41,23 @@ def get_etf_quote(ticker: str) -> dict:
 @st.cache_data(ttl=VOLUME_TTL, show_spinner=False)
 def get_etf_intraday(ticker: str) -> pd.DataFrame:
     return src.fetch_etf_intraday(ticker)
+
+
+@st.cache_data(ttl=DAILY_HIST_TTL, show_spinner=False)
+def get_etf_daily_history(ticker: str) -> pd.DataFrame:
+    return src.fetch_etf_daily_history(ticker, range_str="1mo")
+
+
+@st.cache_data(ttl=INTRADAY_HIST_TTL, show_spinner=False)
+def get_etf_intraday_history(ticker: str) -> pd.DataFrame:
+    return src.fetch_etf_intraday_history(ticker, range_str="10d")
+
+
+@st.cache_data(ttl=DAILY_HIST_TTL, show_spinner=False)
+def get_implied_ratios() -> dict:
+    etf = src.load_etf_daily()
+    daily = {t: get_etf_daily_history(t) for t in ETF_TICKERS}
+    return src.compute_implied_ratios(etf, daily)
 
 
 @st.cache_data(ttl=PRICE_TTL, show_spinner=False)
@@ -64,6 +83,29 @@ ratio_pct = st.slider(
          "this share is assumed to be net new creations (inflow). Tune as we learn.",
 )
 ratio = ratio_pct / 100.0
+
+try:
+    implied = get_implied_ratios()
+except Exception as e:
+    implied = None
+    st.caption(f"⚠ implied-ratio compute failed: {e}")
+
+if implied:
+    parts = []
+    for t in ETF_TICKERS:
+        r = implied.get(t, {}).get("ratio")
+        through = implied.get(t, {}).get("through_date")
+        if r is not None:
+            parts.append(f"**{t}** {r*100:.1f}% (through {through})")
+        else:
+            parts.append(f"**{t}** —")
+    combined = implied.get("combined", {}).get("ratio")
+    combined_str = f"**combined {combined*100:.1f}%**" if combined is not None else "**combined —**"
+    st.caption(
+        "Implied ratio since launch (latest known AUM ÷ volume since launch): "
+        + " · ".join(parts) + " · " + combined_str
+        + " — use this as a sanity check for where to put the slider."
+    )
 
 st.divider()
 
@@ -138,28 +180,67 @@ def live_block(ratio: float) -> None:
 
     st.write("")
 
-    chart_frames = []
-    for tkr, df in intraday.items():
-        if df.empty:
-            continue
-        sub = df[["ts", "cum_volume_usd"]].copy()
-        sub["ticker"] = tkr
-        sub["est_inflow_usd"] = sub["cum_volume_usd"] * ratio
-        chart_frames.append(sub)
-    if chart_frames:
-        combined = pd.concat(chart_frames, ignore_index=True)
-        fig = px.line(
-            combined,
-            x="ts",
-            y="est_inflow_usd",
-            color="ticker",
-            labels={"est_inflow_usd": f"Est. cumulative inflow today (USD @ {int(round(ratio*100))}%)", "ts": ""},
-        )
-        fig.update_layout(height=340, margin=dict(l=0, r=0, t=10, b=0), legend_title_text="")
-        fig.update_yaxes(tickformat="$,.0f")
-        st.plotly_chart(fig, use_container_width=True)
+    chart_range = st.radio(
+        "Cumulative inflow window",
+        options=("Today", "Since launch"),
+        horizontal=True,
+        label_visibility="collapsed",
+        key="chart_range",
+    )
+
+    if chart_range == "Today":
+        chart_frames = []
+        for tkr, df in intraday.items():
+            if df.empty:
+                continue
+            sub = df[["ts", "cum_volume_usd"]].copy()
+            sub["ticker"] = tkr
+            sub["est_inflow_usd"] = sub["cum_volume_usd"] * ratio
+            chart_frames.append(sub)
+        if chart_frames:
+            combined_df = pd.concat(chart_frames, ignore_index=True)
+            fig = px.line(
+                combined_df,
+                x="ts",
+                y="est_inflow_usd",
+                color="ticker",
+                labels={"est_inflow_usd": f"Est. cumulative inflow today (USD @ {int(round(ratio*100))}%)", "ts": ""},
+            )
+            fig.update_layout(height=340, margin=dict(l=0, r=0, t=10, b=0), legend_title_text="")
+            fig.update_yaxes(tickformat="$,.0f")
+            st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.info("Intraday bars not yet available for today.")
     else:
-        st.info("Intraday bars not yet available for today.")
+        try:
+            etf_csv = src.load_etf_daily()
+            daily_by = {t: get_etf_daily_history(t) for t in ETF_TICKERS}
+            intra_hist = {t: get_etf_intraday_history(t) for t in ETF_TICKERS}
+            hist = src.historical_cumulative_inflows(intra_hist, etf_csv, daily_by, fallback_ratio=ratio)
+        except Exception as e:
+            st.error(f"Historical chart fetch failed: {e}")
+            hist = pd.DataFrame()
+        if hist.empty:
+            st.info("No historical 15-min bars returned.")
+        else:
+            fig = px.line(
+                hist,
+                x="ts",
+                y="cum_inflow_usd",
+                color="ticker",
+                labels={
+                    "cum_inflow_usd": f"Est. cumulative inflow since launch (USD, slider {int(round(ratio*100))}% for days without disclosed AUM)",
+                    "ts": "",
+                },
+            )
+            fig.update_layout(height=380, margin=dict(l=0, r=0, t=10, b=0), legend_title_text="")
+            fig.update_yaxes(tickformat="$,.0f")
+            st.plotly_chart(fig, use_container_width=True)
+            st.caption(
+                "On days with a disclosed daily inflow (CSV), the day's own ratio "
+                "(known inflow ÷ that day's volume) is applied to its 15-min bars. "
+                "Days without disclosure use the slider."
+            )
 
 
 live_block(ratio)
@@ -207,9 +288,10 @@ with st.expander("Context: HYPE price (30d) and PURR treasury"):
 with st.sidebar:
     st.header("Source status")
     st.markdown(
-        f"- ✅ **BHYP / THYP volume** — Yahoo Finance (refreshes every {FRAGMENT_REFRESH})\n"
+        f"- ✅ **BHYP / THYP intraday volume** — Yahoo Finance, refresh every {FRAGMENT_REFRESH}\n"
+        "- ✅ **BHYP / THYP 15-min + daily history** — Yahoo Finance\n"
         "- ✅ **HYPE spot** — Hyperliquid public API (hourly)\n"
-        "- 🟡 **PURR treasury** — manual CSV from 8-K filings\n"
+        "- 🟡 **PURR treasury + ETF AUM disclosures** — manual CSVs\n"
     )
     st.divider()
     st.subheader("How the estimate works")
