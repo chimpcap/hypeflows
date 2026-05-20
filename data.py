@@ -28,8 +28,19 @@ BROWSER_HEADERS = {
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36"
     ),
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
     "Accept-Language": "en-US,en;q=0.9",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Cache-Control": "no-cache",
+    "Pragma": "no-cache",
+    "Sec-Ch-Ua": '"Chromium";v="130", "Google Chrome";v="130", "Not?A_Brand";v="99"',
+    "Sec-Ch-Ua-Mobile": "?0",
+    "Sec-Ch-Ua-Platform": '"Windows"',
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "none",
+    "Sec-Fetch-User": "?1",
+    "Upgrade-Insecure-Requests": "1",
 }
 
 
@@ -267,20 +278,19 @@ def compute_implied_ratios(
     return out
 
 
-def fetch_farside_flows() -> pd.DataFrame:
-    """Daily net flows for HYPE ETFs from farside.co.uk/hyp/ (USD).
+FARSIDE_CACHE_PATH = DATA_DIR / "farside_cache.csv"
 
-    Returns columns: date, ticker, actual_inflow_usd (NaN if Farside reports "-").
-    """
-    r = requests.get(FARSIDE_URL, headers=BROWSER_HEADERS, timeout=15)
-    r.raise_for_status()
-    tables = pd.read_html(StringIO(r.text))
+
+def _parse_farside_html(html: str) -> pd.DataFrame:
+    tables = pd.read_html(StringIO(html))
     if len(tables) < 2:
         raise RuntimeError("Farside table layout changed")
     raw = tables[1].copy()
     raw.columns = ["date_str", "BHYP", "THYP", "total"]
     date_pat = r"^\d{1,2}\s+\w{3}\s+\d{4}$"
     body = raw[raw["date_str"].astype(str).str.match(date_pat, na=False)].copy()
+    if body.empty:
+        raise RuntimeError("no date rows found in Farside table")
     body["date"] = pd.to_datetime(body["date_str"], format="%d %b %Y").dt.date
 
     def parse(v: object) -> float | None:
@@ -298,6 +308,39 @@ def fetch_farside_flows() -> pd.DataFrame:
     )
     long["actual_inflow_usd"] = long["raw"].map(parse)
     return long[["date", "ticker", "actual_inflow_usd"]].sort_values(["date", "ticker"]).reset_index(drop=True)
+
+
+def fetch_farside_flows() -> tuple[pd.DataFrame, str]:
+    """Daily net flows for HYPE ETFs from farside.co.uk/hyp/ (USD).
+
+    Tries live Farside first. If that fails (e.g. cloud IP is blocked), falls
+    back to data/farside_cache.csv. Always returns a (df, source) tuple so the
+    UI can show provenance — source is "live" or "cache: <reason>".
+
+    df columns: date, ticker, actual_inflow_usd (NaN if no flow reported).
+    """
+    live_err: str | None = None
+    try:
+        r = requests.get(FARSIDE_URL, headers=BROWSER_HEADERS, timeout=15)
+        if r.status_code != 200:
+            live_err = f"HTTP {r.status_code} ({len(r.text)} bytes)"
+        elif len(r.text) < 1000:
+            live_err = f"suspiciously small response ({len(r.text)} bytes)"
+        else:
+            df = _parse_farside_html(r.text)
+            try:
+                df.to_csv(FARSIDE_CACHE_PATH, index=False)
+            except Exception:
+                pass
+            return df, "live"
+    except Exception as e:
+        live_err = f"{type(e).__name__}: {e}"
+
+    if FARSIDE_CACHE_PATH.exists():
+        df = pd.read_csv(FARSIDE_CACHE_PATH, parse_dates=["date"])
+        df["date"] = df["date"].dt.date
+        return df, f"cache (live failed: {live_err})"
+    raise RuntimeError(f"Farside live fetch failed and no cache file: {live_err}")
 
 
 def build_actuals_table(

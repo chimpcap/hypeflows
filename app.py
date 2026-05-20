@@ -63,15 +63,15 @@ def get_implied_ratios() -> dict:
 
 
 @st.cache_data(ttl=FARSIDE_TTL, show_spinner=False)
-def get_farside() -> pd.DataFrame:
+def get_farside() -> tuple[pd.DataFrame, str]:
     return src.fetch_farside_flows()
 
 
 @st.cache_data(ttl=FARSIDE_TTL, show_spinner=False)
-def get_actuals_table(ratio: float) -> pd.DataFrame:
-    fs = get_farside()
+def get_actuals_table(ratio: float) -> tuple[pd.DataFrame, str]:
+    fs, source = get_farside()
     daily = {t: get_etf_daily_history(t) for t in ETF_TICKERS}
-    return src.build_actuals_table(fs, daily, slider_ratio=ratio)
+    return src.build_actuals_table(fs, daily, slider_ratio=ratio), source
 
 
 @st.cache_data(ttl=PRICE_TTL, show_spinner=False)
@@ -107,9 +107,11 @@ market_clock_block()
 
 ratio_pct = st.slider(
     "Estimated net-inflow ratio (% of $ volume that represents new creations)",
-    min_value=25, max_value=35, value=30, step=1,
+    min_value=25, max_value=50, value=30, step=1,
     help="Rule-of-thumb proxy: of all the dollars that traded in the ETF today, "
-         "this share is assumed to be net new creations (inflow). Tune as we learn.",
+         "this share is assumed to be net new creations (inflow). Tune as we learn. "
+         "Farside actuals so far suggest the empirical ratio is in the 40-55% range "
+         "(see table at the bottom).",
 )
 ratio = ratio_pct / 100.0
 
@@ -286,10 +288,17 @@ st.caption(
 )
 
 try:
-    actuals = get_actuals_table(ratio)
+    actuals, farside_source = get_actuals_table(ratio)
 except Exception as e:
     actuals = pd.DataFrame()
-    st.warning(f"Farside fetch failed — leaving the table empty for now. ({e})")
+    farside_source = None
+    st.warning(f"Farside fetch failed — leaving the table empty for now. ({type(e).__name__}: {e})")
+
+if farside_source:
+    if farside_source == "live":
+        st.caption("Farside data: ✅ **live** from farside.co.uk/hyp")
+    else:
+        st.caption(f"Farside data: ⚠ **{farside_source}** — using the committed CSV in `data/farside_cache.csv`.")
 
 if actuals.empty:
     st.info("No actuals available.")
