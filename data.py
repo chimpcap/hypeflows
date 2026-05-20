@@ -12,6 +12,7 @@ Replace the CSV-backed loaders with live fetchers as we wire them up.
 from __future__ import annotations
 
 import time
+from io import StringIO
 from pathlib import Path
 
 import pandas as pd
@@ -21,6 +22,15 @@ DATA_DIR = Path(__file__).parent / "data"
 HL_INFO_URL = "https://api.hyperliquid.xyz/info"
 YF_CHART_URL = "https://query1.finance.yahoo.com/v8/finance/chart/{ticker}"
 YF_HEADERS = {"User-Agent": "Mozilla/5.0"}
+FARSIDE_URL = "https://farside.co.uk/hyp/"
+BROWSER_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36"
+    ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+}
 
 
 # ---------- HYPE price (live) -----------------------------------------------
@@ -255,6 +265,129 @@ def compute_implied_ratios(
         "volume_usd": total_volume,
     }
     return out
+
+
+def fetch_farside_flows() -> pd.DataFrame:
+    """Daily net flows for HYPE ETFs from farside.co.uk/hyp/ (USD).
+
+    Returns columns: date, ticker, actual_inflow_usd (NaN if Farside reports "-").
+    """
+    r = requests.get(FARSIDE_URL, headers=BROWSER_HEADERS, timeout=15)
+    r.raise_for_status()
+    tables = pd.read_html(StringIO(r.text))
+    if len(tables) < 2:
+        raise RuntimeError("Farside table layout changed")
+    raw = tables[1].copy()
+    raw.columns = ["date_str", "BHYP", "THYP", "total"]
+    date_pat = r"^\d{1,2}\s+\w{3}\s+\d{4}$"
+    body = raw[raw["date_str"].astype(str).str.match(date_pat, na=False)].copy()
+    body["date"] = pd.to_datetime(body["date_str"], format="%d %b %Y").dt.date
+
+    def parse(v: object) -> float | None:
+        s = str(v).strip()
+        if s in ("-", "", "nan", "NaN"):
+            return None
+        s = s.replace(",", "")
+        try:
+            return float(s) * 1e6
+        except ValueError:
+            return None
+
+    long = body.melt(
+        id_vars=["date"], value_vars=["BHYP", "THYP"], var_name="ticker", value_name="raw"
+    )
+    long["actual_inflow_usd"] = long["raw"].map(parse)
+    return long[["date", "ticker", "actual_inflow_usd"]].sort_values(["date", "ticker"]).reset_index(drop=True)
+
+
+def build_actuals_table(
+    farside: pd.DataFrame,
+    daily_by_ticker: dict[str, pd.DataFrame],
+    slider_ratio: float,
+) -> pd.DataFrame:
+    """Join Farside actual flows with Yahoo daily volume + slider-based estimate.
+
+    Returns: date, ticker, actual_inflow_usd, day_volume_usd, actual_ratio,
+             estimated_at_slider_usd, diff_usd.
+    """
+    if farside.empty:
+        return pd.DataFrame()
+    rows = []
+    daily_lookup = {
+        t: {row["date"]: row["volume_usd"] for _, row in df.iterrows()}
+        for t, df in daily_by_ticker.items()
+    }
+    for _, r in farside.iterrows():
+        t = r["ticker"]
+        vol = daily_lookup.get(t, {}).get(r["date"])
+        actual = r["actual_inflow_usd"]
+        est = float(vol) * float(slider_ratio) if vol else None
+        ratio = (float(actual) / float(vol)) if (vol and actual is not None) else None
+        rows.append(
+            {
+                "date": r["date"],
+                "ticker": t,
+                "actual_inflow_usd": actual,
+                "day_volume_usd": float(vol) if vol else None,
+                "actual_ratio": ratio,
+                "estimated_at_slider_usd": est,
+                "diff_usd": (float(actual) - est) if (actual is not None and est is not None) else None,
+            }
+        )
+    return pd.DataFrame(rows).sort_values(["date", "ticker"]).reset_index(drop=True)
+
+
+def market_clock(now_utc: pd.Timestamp | None = None) -> dict:
+    """US equity market clock (NYSE/Nasdaq core session).
+
+    Honest scope: handles weekends and the 09:30–16:00 ET window. Does NOT know
+    about US holidays — if you want bullet-proof state on holidays, swap to
+    pandas_market_calendars later.
+    """
+    from zoneinfo import ZoneInfo
+    from datetime import datetime, time, timedelta
+
+    et = ZoneInfo("America/New_York")
+    now = (now_utc or pd.Timestamp.now(tz="UTC")).tz_convert(et).to_pydatetime()
+    open_t, close_t = time(9, 30), time(16, 0)
+
+    def next_open_after(d: datetime) -> datetime:
+        cursor = datetime.combine(d.date(), open_t, tzinfo=et)
+        if d.time() >= open_t:
+            cursor = cursor + timedelta(days=1)
+        while cursor.weekday() >= 5:  # 5=Sat, 6=Sun
+            cursor = cursor + timedelta(days=1)
+        return cursor
+
+    weekday = now.weekday() < 5
+    if weekday and open_t <= now.time() < close_t:
+        close_dt = datetime.combine(now.date(), close_t, tzinfo=et)
+        return {
+            "state": "open",
+            "message": "Market is OPEN",
+            "until": close_dt,
+            "seconds_until": int((close_dt - now).total_seconds()),
+            "label_until": "closes",
+        }
+    nxt = next_open_after(now)
+    return {
+        "state": "premarket" if weekday and now.time() < open_t else "closed",
+        "message": "Market is CLOSED",
+        "until": nxt,
+        "seconds_until": int((nxt - now).total_seconds()),
+        "label_until": "opens",
+    }
+
+
+def fmt_countdown(seconds: int) -> str:
+    if seconds < 0:
+        seconds = 0
+    h, rem = divmod(seconds, 3600)
+    m, s = divmod(rem, 60)
+    if h >= 24:
+        d, h = divmod(h, 24)
+        return f"{d}d {h:02d}:{m:02d}:{s:02d}"
+    return f"{h:02d}:{m:02d}:{s:02d}"
 
 
 def historical_cumulative_inflows(

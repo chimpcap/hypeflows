@@ -22,7 +22,9 @@ PRICE_TTL = 3600
 VOLUME_TTL = 10
 INTRADAY_HIST_TTL = 900       # 15-min bars don't change faster than this
 DAILY_HIST_TTL = 1800         # daily bars settle once per session
+FARSIDE_TTL = 1800            # Farside posts ~once/day
 FRAGMENT_REFRESH = "15s"
+CLOCK_REFRESH = "1s"
 ETF_TICKERS = ("BHYP", "THYP")
 
 
@@ -60,6 +62,18 @@ def get_implied_ratios() -> dict:
     return src.compute_implied_ratios(etf, daily)
 
 
+@st.cache_data(ttl=FARSIDE_TTL, show_spinner=False)
+def get_farside() -> pd.DataFrame:
+    return src.fetch_farside_flows()
+
+
+@st.cache_data(ttl=FARSIDE_TTL, show_spinner=False)
+def get_actuals_table(ratio: float) -> pd.DataFrame:
+    fs = get_farside()
+    daily = {t: get_etf_daily_history(t) for t in ETF_TICKERS}
+    return src.build_actuals_table(fs, daily, slider_ratio=ratio)
+
+
 @st.cache_data(ttl=PRICE_TTL, show_spinner=False)
 def get_purr() -> pd.DataFrame:
     return src.load_purr_holdings()
@@ -75,6 +89,21 @@ st.caption(
     "computed as today's USD trading volume × your inflow ratio. "
     "Tiles refresh automatically — no reload needed."
 )
+
+
+@st.fragment(run_every=CLOCK_REFRESH)
+def market_clock_block() -> None:
+    clk = src.market_clock()
+    countdown = src.fmt_countdown(clk["seconds_until"])
+    et_until = clk["until"].strftime("%H:%M ET")
+    if clk["state"] == "open":
+        st.success(f"🟢 **{clk['message']}** · {clk['label_until']} {et_until} (in {countdown})")
+    else:
+        label = "premarket — opens" if clk["state"] == "premarket" else "next open"
+        st.warning(f"🟡 **{clk['message']}** · {label} {et_until} (in {countdown})")
+
+
+market_clock_block()
 
 ratio_pct = st.slider(
     "Estimated net-inflow ratio (% of $ volume that represents new creations)",
@@ -244,6 +273,53 @@ def live_block(ratio: float) -> None:
 
 
 live_block(ratio)
+
+st.divider()
+
+# ---------- actuals vs estimate table (Farside) ----------
+
+st.subheader("Actual daily inflows vs our estimate")
+st.caption(
+    "Actuals are net daily flows reported by farside.co.uk/hyp. "
+    "`Actual ratio` = actual inflow ÷ Yahoo $ volume that day — that's the empirical version "
+    "of the slider above. Big positive `Diff` means our slider was too low for that day."
+)
+
+try:
+    actuals = get_actuals_table(ratio)
+except Exception as e:
+    actuals = pd.DataFrame()
+    st.warning(f"Farside fetch failed — leaving the table empty for now. ({e})")
+
+if actuals.empty:
+    st.info("No actuals available.")
+else:
+    display = actuals.copy()
+    display["actual_inflow_usd"] = display["actual_inflow_usd"].apply(lambda v: f"${v/1e6:,.2f}M" if pd.notna(v) else "—")
+    display["day_volume_usd"] = display["day_volume_usd"].apply(lambda v: f"${v/1e6:,.2f}M" if pd.notna(v) else "—")
+    display["actual_ratio"] = display["actual_ratio"].apply(lambda v: f"{v*100:,.1f}%" if pd.notna(v) else "—")
+    display["estimated_at_slider_usd"] = display["estimated_at_slider_usd"].apply(lambda v: f"${v/1e6:,.2f}M" if pd.notna(v) else "—")
+    display["diff_usd"] = display["diff_usd"].apply(lambda v: f"{'+' if v >= 0 else ''}${v/1e6:,.2f}M" if pd.notna(v) else "—")
+    display.columns = ["Date", "Ticker", "Actual inflow", "Day $ volume", "Actual ratio",
+                       f"Est. @ {int(round(ratio*100))}%", "Actual − Est."]
+    st.dataframe(display.sort_values(["Date", "Ticker"], ascending=[False, True]),
+                 use_container_width=True, hide_index=True)
+
+    valid = actuals.dropna(subset=["actual_inflow_usd", "day_volume_usd"])
+    if not valid.empty:
+        per_ticker = (
+            valid.groupby("ticker")
+            .apply(lambda g: g["actual_inflow_usd"].sum() / g["day_volume_usd"].sum())
+            .to_dict()
+        )
+        combined = valid["actual_inflow_usd"].sum() / valid["day_volume_usd"].sum()
+        parts = [f"**{t}** {r*100:.1f}%" for t, r in per_ticker.items()]
+        parts.append(f"**combined {combined*100:.1f}%**")
+        st.caption(
+            "Empirical cumulative ratio from Farside actuals ÷ Yahoo volumes: "
+            + " · ".join(parts)
+            + " — better anchor than the AUM proxy above."
+        )
 
 st.divider()
 
