@@ -79,6 +79,11 @@ def get_purr() -> pd.DataFrame:
     return src.load_purr_holdings()
 
 
+@st.cache_data(ttl=DAILY_HIST_TTL, show_spinner=False)
+def get_etf_holdings() -> pd.DataFrame:
+    return src.load_etf_holdings()
+
+
 # ---------- page ----------
 
 st.set_page_config(page_title="HYPE Flows", page_icon="📈", layout="wide")
@@ -190,12 +195,24 @@ def live_block(ratio: float) -> None:
 
     st.write("")
 
+    try:
+        holdings_df = get_etf_holdings()
+    except Exception:
+        holdings_df = pd.DataFrame()
+
     cols = st.columns(2)
     for col, tkr in zip(cols, ETF_TICKERS):
         q = quotes[tkr]
         est_usd = src.estimated_inflow_usd(q, ratio)
         est_hype = (est_usd / hype_px) if hype_px else 0.0
         change = (q["price"] - q["previous_close"]) / q["previous_close"] * 100 if q["previous_close"] else 0
+
+        nav_info = None
+        if not holdings_df.empty:
+            latest = src.latest_holdings(holdings_df, tkr)
+            if latest is not None:
+                nav_info = src.compute_nav_metrics(latest, hype_price=hype_px or 0, market_price=q["price"])
+
         with col:
             st.subheader(tkr)
             t1, t2 = st.columns(2)
@@ -208,6 +225,35 @@ def live_block(ratio: float) -> None:
                 f"${est_usd/1e6:,.2f}M",
                 help=f"≈ {est_hype:,.0f} HYPE absorbed" if hype_px else None,
             )
+            t5, t6 = st.columns(2)
+            if nav_info and nav_info.get("live_nav_per_share"):
+                pd_val = nav_info.get("premium_discount")
+                t5.metric(
+                    "NAV / share (live)",
+                    f"${nav_info['live_nav_per_share']:,.2f}",
+                    f"prem/disc {pd_val*100:+.2f}%" if pd_val is not None else None,
+                    help=(
+                        f"= {nav_info['hype_held']:,.0f} HYPE × ${hype_px:,.2f} ÷ "
+                        f"{nav_info['shares_outstanding']:,.0f} shares · "
+                        f"holdings as of {nav_info['date']}"
+                    ),
+                )
+            else:
+                t5.metric("NAV / share (live)", "—")
+            if nav_info and nav_info.get("hype_held") is not None:
+                hh = nav_info["hype_held"]
+                live_aum = nav_info.get("live_aum_usd") or 0
+                t6.metric(
+                    "HYPE held",
+                    f"{hh/1e3:,.1f}k",
+                    help=(
+                        f"{hh:,.0f} HYPE · live AUM ≈ ${live_aum/1e6:,.2f}M · "
+                        f"shares out {nav_info['shares_outstanding']:,.0f} · "
+                        f"source: {nav_info['hype_held_source']}"
+                    ),
+                )
+            else:
+                t6.metric("HYPE held", "—")
 
     st.write("")
 

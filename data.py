@@ -499,6 +499,80 @@ def load_etf_daily() -> pd.DataFrame:
     return df.sort_values(["date", "fund"]).reset_index(drop=True)
 
 
+# ---------- BHYP / THYP holdings + NAV (CSV from issuer pages) -------------
+
+def load_etf_holdings() -> pd.DataFrame:
+    """Latest disclosed shares outstanding + HYPE holdings per fund.
+
+    Returns: date, fund, shares_outstanding, hype_held, aum_usd,
+             nav_per_share, source.
+
+    `hype_held` may be NaN when the issuer doesn't publish it (THYP).
+    """
+    df = pd.read_csv(DATA_DIR / "etf_holdings.csv", parse_dates=["date"])
+    return df.sort_values(["fund", "date"]).reset_index(drop=True)
+
+
+def latest_holdings(holdings_df: pd.DataFrame, fund: str) -> dict | None:
+    """Most-recent row for a single fund as a dict, or None if not present."""
+    sub = holdings_df[holdings_df["fund"] == fund]
+    if sub.empty:
+        return None
+    row = sub.iloc[-1]
+    return {
+        "date": row["date"].date() if hasattr(row["date"], "date") else row["date"],
+        "fund": fund,
+        "shares_outstanding": float(row["shares_outstanding"]) if pd.notna(row["shares_outstanding"]) else None,
+        "hype_held": float(row["hype_held"]) if pd.notna(row["hype_held"]) else None,
+        "aum_usd": float(row["aum_usd"]) if pd.notna(row["aum_usd"]) else None,
+        "nav_per_share": float(row["nav_per_share"]) if pd.notna(row["nav_per_share"]) else None,
+        "source": str(row.get("source", "")),
+    }
+
+
+def compute_nav_metrics(holdings: dict, hype_price: float, market_price: float | None = None) -> dict:
+    """Combine the latest disclosed holdings with the current HYPE price.
+
+    Returns:
+      disclosed_nav      - what the issuer published (may be from a prior date)
+      hype_held          - disclosed token count, or AUM/hype_price if not disclosed
+      hype_held_source   - 'disclosed' or 'inferred'
+      live_aum_usd       - hype_held × current hype_price
+      live_nav_per_share - live_aum_usd / shares_outstanding
+      premium_discount   - market_price / live_nav_per_share - 1   (None if no market_price)
+    """
+    out: dict = {**holdings, "hype_price": hype_price}
+    shares = holdings.get("shares_outstanding")
+    aum = holdings.get("aum_usd")
+    hype_held = holdings.get("hype_held")
+
+    if hype_held is None and aum is not None and hype_price:
+        hype_held = aum / hype_price
+        out["hype_held"] = hype_held
+        out["hype_held_source"] = "inferred"
+    else:
+        out["hype_held_source"] = "disclosed" if hype_held is not None else "unknown"
+
+    if hype_held is not None and hype_price:
+        out["live_aum_usd"] = hype_held * hype_price
+    else:
+        out["live_aum_usd"] = None
+
+    if shares and out["live_aum_usd"] is not None:
+        out["live_nav_per_share"] = out["live_aum_usd"] / shares
+    else:
+        out["live_nav_per_share"] = None
+
+    out["disclosed_nav"] = holdings.get("nav_per_share")
+
+    if market_price and out["live_nav_per_share"]:
+        out["premium_discount"] = market_price / out["live_nav_per_share"] - 1
+    else:
+        out["premium_discount"] = None
+
+    return out
+
+
 # ---------- Combined HYPE absorbed -----------------------------------------
 
 def unified_hype_absorbed(
